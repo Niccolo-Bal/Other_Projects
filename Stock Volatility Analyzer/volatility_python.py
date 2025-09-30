@@ -6,6 +6,43 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
 import threading
+import math
+
+class FastMath:
+
+    def calculate_volatility(self, returns, scaling_factor):
+        if len(returns) < 2:
+            return 0.0
+
+        mean = np.mean(returns)
+        variance = np.var(returns, ddof=1)
+        return math.sqrt(variance) * scaling_factor
+
+    def calculate_growth_adjusted_volatility(self, returns, scaling_factor, period):
+        if len(returns) < 2:
+            return 0.0
+
+        cumulative_return = np.prod(1.0 + returns)
+
+        if period == "Daily":
+            periods_per_year = 252.0
+        elif period == "Weekly":
+            periods_per_year = 52.0
+        elif period == "Monthly":
+            periods_per_year = 12.0
+        elif period == "Quarterly":
+            periods_per_year = 4.0
+        else:
+            periods_per_year = 252.0
+
+        years = len(returns) / periods_per_year
+        annualized_growth = (cumulative_return ** (1.0/years)) - 1.0
+
+        if abs(annualized_growth) < 1e-10:
+            return self.calculate_volatility(returns, scaling_factor)
+        else:
+            raw_volatility = self.calculate_volatility(returns, scaling_factor)
+            return abs(raw_volatility / annualized_growth)
 
 class VolatilityAnalyzer:
     def __init__(self, root):
@@ -18,16 +55,15 @@ class VolatilityAnalyzer:
         self.results = []
         self.is_analyzing = False
 
+        self.fast_math = FastMath()
+
         self.load_tickers()
 
         self.create_widgets()
 
     def load_tickers(self):
         try:
-            import os
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            csv_path = os.path.join(script_dir, 'Top Tickers.csv')
-            df = pd.read_csv(csv_path)
+            df = pd.read_csv('Top Tickers.csv')
             all_tickers = df['Symbol'].tolist()
 
             self.tickers = []
@@ -255,15 +291,17 @@ class VolatilityAnalyzer:
         volatility_data = []
 
         total_tickers = len(tickers_to_analyze)
+
         self.status_var.set(f"Analyzing {total_tickers} stocks ({volatility_type} {volatility_period} volatility)...")
 
-        for i, ticker in enumerate(tickers_to_analyze):
+        for i in range(total_tickers):
             if not self.is_analyzing:
                 break
 
+            ticker = tickers_to_analyze[i]
             try:
                 # Update progress
-                progress = (i / total_tickers) * 100
+                progress = (i / total_tickers) * 100.0
                 self.progress_var.set(progress)
                 self.status_var.set(f"Processing {ticker} ({i+1}/{total_tickers}) - {volatility_type} {volatility_period}")
 
@@ -281,10 +319,12 @@ class VolatilityAnalyzer:
                 continue
 
         if self.is_analyzing:
-                df = pd.DataFrame(volatility_data)
+            # Sort results and show all analyzed stocks
+            df = pd.DataFrame(volatility_data)
             if not df.empty:
                 df = df.sort_values('Volatility', ascending=False)
 
+                # Display all results since we already processed only the requested number
                 self.root.after(0, self.display_results, df, start_date, end_date, volatility_period, volatility_type)
             else:
                 self.root.after(0, self.display_no_results)
@@ -302,7 +342,7 @@ class VolatilityAnalyzer:
             if period == "Daily":
                 data['Returns'] = data['Close'].pct_change()
                 returns = data['Returns'].dropna()
-                scaling_factor = np.sqrt(252)
+                scaling_factor = math.sqrt(252.0)
 
             elif period == "Weekly":
                 weekly_data = data['Close'].resample('W').last()
@@ -310,7 +350,7 @@ class VolatilityAnalyzer:
                 if len(weekly_returns) < 2:
                     return None
                 returns = weekly_returns
-                scaling_factor = np.sqrt(52)
+                scaling_factor = math.sqrt(52.0)
 
             elif period == "Monthly":
                 monthly_data = data['Close'].resample('M').last()
@@ -318,7 +358,7 @@ class VolatilityAnalyzer:
                 if len(monthly_returns) < 2:
                     return None
                 returns = monthly_returns
-                scaling_factor = np.sqrt(12)
+                scaling_factor = math.sqrt(12.0)
 
             elif period == "Quarterly":
                 quarterly_data = data['Close'].resample('Q').last()
@@ -326,35 +366,18 @@ class VolatilityAnalyzer:
                 if len(quarterly_returns) < 2:
                     return None
                 returns = quarterly_returns
-                scaling_factor = np.sqrt(4)
+                scaling_factor = math.sqrt(4.0)
+
+            returns_array = np.asarray(returns, dtype=np.float64)
 
             if volatility_type == "Raw":
-                volatility = returns.std() * scaling_factor
+                volatility = self.fast_math.calculate_volatility(returns_array, scaling_factor)
 
             elif volatility_type == "Growth-Adjusted":
                 if len(returns) < 2:
                     return None
 
-                cumulative_return = (1 + returns).prod()
-                time_periods = len(returns)
-
-                if period == "Daily":
-                    periods_per_year = 252
-                elif period == "Weekly":
-                    periods_per_year = 52
-                elif period == "Monthly":
-                    periods_per_year = 12
-                elif period == "Quarterly":
-                    periods_per_year = 4
-
-                years = time_periods / periods_per_year
-                annualized_growth = (cumulative_return ** (1/years)) - 1
-
-                if abs(annualized_growth) < 1e-10:
-                    volatility = returns.std() * scaling_factor
-                else:
-                    raw_volatility = returns.std() * scaling_factor
-                    volatility = abs(raw_volatility / annualized_growth)
+                volatility = self.fast_math.calculate_growth_adjusted_volatility(returns_array, scaling_factor, period)
 
             return volatility
 
