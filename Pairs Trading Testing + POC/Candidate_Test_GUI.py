@@ -11,6 +11,15 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator
 
+# Import profit calc helpers (expects Profit_Calc.py in same directory)
+try:
+    from Profit_Calc import fit_hedge_ratio, compute_spread, simulate_pairs_trade
+except Exception:
+    # lazy fallback if import fails; functions will be required when running simulation
+    fit_hedge_ratio = None
+    compute_spread = None
+    simulate_pairs_trade = None
+
 
 class CointegrationTestGUI:
     def __init__(self, root):
@@ -22,6 +31,11 @@ class CointegrationTestGUI:
         style.configure('Header.TLabel', font=('Times New Roman', 10, 'bold'))
 
         self.create_widgets()
+
+        # placeholders for the last downloaded/processed data so profit simulation can reuse
+        self.last_combined = None
+        self.last_hedge_ratio = None
+        self.last_intercept = None
 
     def create_widgets(self):
         main_frame = ttk.Frame(self.root, padding="10")
@@ -98,20 +112,46 @@ class CointegrationTestGUI:
         reversion_min_entry = ttk.Entry(reversion_frame, textvariable=self.reversion_min_var, width=6)
         reversion_min_entry.grid(row=0, column=3, padx=5)
 
+        # Date inputs for optional train/trade selection (used by profit simulation)
+        ttk.Label(left_frame, text="Train start (YYYY-MM-DD):", style='Header.TLabel').grid(row=5, column=0, sticky=tk.W, pady=3)
+        self.train_start_var = tk.StringVar()
+        ttk.Entry(left_frame, textvariable=self.train_start_var, width=15).grid(row=5, column=1, sticky=tk.W)
+
+        ttk.Label(left_frame, text="Train end (YYYY-MM-DD):", style='Header.TLabel').grid(row=6, column=0, sticky=tk.W, pady=3)
+        self.train_end_var = tk.StringVar()
+        ttk.Entry(left_frame, textvariable=self.train_end_var, width=15).grid(row=6, column=1, sticky=tk.W)
+
+        ttk.Label(left_frame, text="Trade start (YYYY-MM-DD):", style='Header.TLabel').grid(row=7, column=0, sticky=tk.W, pady=3)
+        self.trade_start_var = tk.StringVar()
+        ttk.Entry(left_frame, textvariable=self.trade_start_var, width=15).grid(row=7, column=1, sticky=tk.W)
+
+        ttk.Label(left_frame, text="Trade end (YYYY-MM-DD):", style='Header.TLabel').grid(row=8, column=0, sticky=tk.W, pady=3)
+        self.trade_end_var = tk.StringVar()
+        ttk.Entry(left_frame, textvariable=self.trade_end_var, width=15).grid(row=8, column=1, sticky=tk.W)
+
+        # Option: normalize prices for plotting (percent of start)
+        self.normalize_prices_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(left_frame, text="Normalize prices (%)", variable=self.normalize_prices_var).grid(row=9, column=0, columnspan=2, sticky=tk.W, pady=6)
+
         self.run_button = ttk.Button(left_frame, text="Run Cointegration Test",
                                       command=self.run_test, style='Accent.TButton')
-        self.run_button.grid(row=5, column=0, columnspan=2, pady=20)
+        self.run_button.grid(row=10, column=0, columnspan=2, pady=8)
+
+        # Button to run profit/backtest simulation using Profit_Calc logic
+        self.run_profit_button = ttk.Button(left_frame, text="Run Profit Simulation",
+                                           command=self.run_profit_simulation)
+        self.run_profit_button.grid(row=10, column=2, padx=(10,0), pady=8)
 
         self.progress = ttk.Progressbar(left_frame, mode='indeterminate', length=300)
-        self.progress.grid(row=6, column=0, columnspan=2, pady=5)
+        self.progress.grid(row=11, column=0, columnspan=2, pady=5)
 
-        ttk.Label(left_frame, text="Results:", style='Header.TLabel').grid(row=7, column=0, sticky=tk.W, pady=(10, 5))
+        ttk.Label(left_frame, text="Results:", style='Header.TLabel').grid(row=12, column=0, sticky=tk.W, pady=(10, 5))
 
         self.results_text = tk.Text(left_frame, width=55, height=22,
                                      wrap=tk.WORD, font=('Courier', 12))
-        self.results_text.grid(row=8, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        self.results_text.grid(row=13, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
 
-        left_frame.rowconfigure(8, weight=1)
+        left_frame.rowconfigure(13, weight=1)
 
         self.figure = Figure(figsize=(8, 6))
         self.canvas = FigureCanvasTkAgg(self.figure, master=right_frame)
@@ -127,8 +167,10 @@ class CointegrationTestGUI:
         """Clear the results text area"""
         self.results_text.delete(1.0, tk.END)
 
-    def plot_residuals(self, residuals, ticker1, ticker2, prices1, prices2):
-        """Plot residuals and individual asset prices"""
+    def plot_residuals(self, residuals, ticker1, ticker2, prices1, prices2, prices_are_percent=True):
+        """Plot residuals and individual asset prices
+        prices_are_percent: if True, y-labels show percent; otherwise raw price units
+        """
         self.figure.clear()
 
         gs = self.figure.add_gridspec(2, 2, height_ratios=[2, 1], hspace=0.3, wspace=0.3)
@@ -137,15 +179,15 @@ class CointegrationTestGUI:
         mean = residuals.mean()
         std = residuals.std()
 
-        ax1.plot(residuals.index, residuals.values, linewidth=1, label='Spread (ε)', color='blue')
+        ax1.plot(residuals.index, residuals.values, linewidth=1, label='Spread (ε, %)', color='blue')
         ax1.axhline(y=mean, color='red', linestyle='--', linewidth=1, label='Mean')
         ax1.axhline(y=mean + std, color='orange', linestyle=':', linewidth=1, label='±1σ')
         ax1.axhline(y=mean - std, color='orange', linestyle=':', linewidth=1)
         ax1.axhline(y=mean + 2*std, color='green', linestyle=':', linewidth=0.8, label='±2σ')
         ax1.axhline(y=mean - 2*std, color='green', linestyle=':', linewidth=0.8)
 
-        ax1.set_ylabel('Residual Value ($)', fontsize=9)
-        ax1.set_title(f'Spread: {ticker1} - β*{ticker2}', fontsize=10)
+        ax1.set_ylabel('Residual (%)', fontsize=9)
+        ax1.set_title(f'Spread (percent dev): {ticker1} - β*{ticker2}', fontsize=10)
         ax1.legend(loc='best', fontsize=7)
         ax1.grid(True, alpha=0.3)
         ax1.tick_params(axis='both', labelsize=8)
@@ -153,7 +195,7 @@ class CointegrationTestGUI:
         ax2 = self.figure.add_subplot(gs[1, 0])
         ax2.plot(prices1.index, prices1.values, linewidth=1, color='darkblue')
         ax2.set_xlabel('Date', fontsize=9)
-        ax2.set_ylabel(f'{ticker1} Price ($)', fontsize=9)
+        ax2.set_ylabel(f'{ticker1} Price (% of start)' if prices_are_percent else f'{ticker1} Price', fontsize=9)
         ax2.grid(True, alpha=0.3)
         ax2.tick_params(axis='both', labelsize=8)
         ax2.xaxis.set_major_locator(MaxNLocator(nbins=4))
@@ -162,7 +204,7 @@ class CointegrationTestGUI:
         ax3 = self.figure.add_subplot(gs[1, 1])
         ax3.plot(prices2.index, prices2.values, linewidth=1, color='darkgreen')
         ax3.set_xlabel('Date', fontsize=9)
-        ax3.set_ylabel(f'{ticker2} Price ($)', fontsize=9)
+        ax3.set_ylabel(f'{ticker2} Price (% of start)' if prices_are_percent else f'{ticker2} Price', fontsize=9)
         ax3.grid(True, alpha=0.3)
         ax3.tick_params(axis='both', labelsize=8)
         ax3.xaxis.set_major_locator(MaxNLocator(nbins=4))
@@ -285,7 +327,8 @@ class CointegrationTestGUI:
     def count_reversions(self, residuals, max_threshold, min_threshold):
         """Count mean reversions from ±max_threshold σ back to ±min_threshold σ"""
         mean = residuals.mean()
-        std = residuals.std()
+        # use population std (ddof=0) to match Profit_Calc's default
+        std = residuals.std(ddof=0)
 
         z_scores = (residuals - mean) / std
 
@@ -334,26 +377,130 @@ class CointegrationTestGUI:
             combined[ticker1], combined[ticker2], ticker1, ticker2
         )
 
-        spread_std = residuals.std()
-        reversions = self.count_reversions(residuals, reversion_max, reversion_min)
+        # Convert residuals to percent deviation from the modeled value
+        modeled_values = intercept + hedge_ratio * combined[ticker2]
+        # avoid division by zero
+        modeled_values = modeled_values.replace(0, np.nan)
+        percent_residuals = (residuals / modeled_values) * 100.0
+        percent_residuals = percent_residuals.dropna()
+
+        # Normalize prices to percent of starting value for plotting
+        percent_prices1 = combined[ticker1] / combined[ticker1].iloc[0] * 100.0
+        percent_prices2 = combined[ticker2] / combined[ticker2].iloc[0] * 100.0
+
+        # use population std (ddof=0) to match Profit_Calc
+        spread_std = percent_residuals.std(ddof=0)
+        reversions = self.count_reversions(percent_residuals, reversion_max, reversion_min)
 
         correlation = combined[ticker1].corr(combined[ticker2])
         r_squared = correlation ** 2
 
-        current_z_score = (residuals.iloc[-1] - residuals.mean()) / residuals.std()
+        current_z_score = (percent_residuals.iloc[-1] - percent_residuals.mean()) / (percent_residuals.std(ddof=0) + 1e-12)
 
-        adf_pval = self.adf_test(residuals, "Residuals (epsilon)", lag_param)
+        adf_pval = self.adf_test(percent_residuals, "Residuals (epsilon, %)", lag_param)
         eg_pval = self.engle_granger_test(combined[ticker1], combined[ticker2], ticker1, ticker2)
 
-        self.plot_residuals(residuals, ticker1, ticker2, combined[ticker1], combined[ticker2])
+        # Store last combined and regression params so profit simulation can reuse them
+        self.last_combined = combined.copy()
+        self.last_hedge_ratio = hedge_ratio
+        self.last_intercept = intercept
+
+        self.plot_residuals(percent_residuals, ticker1, ticker2, percent_prices1, percent_prices2)
 
         self.log(f"Regression Equation:\n{ticker1} = {intercept:.6f} + {hedge_ratio:.6f}*{ticker2} + ε")
-        self.log(f"Spread Standard Deviation (σ): {spread_std:.6f}")
+        self.log(f"Spread Standard Deviation (σ): {spread_std:.6f}%")
         self.log(f"Correlation (R), R squared: {correlation:.6f}, {r_squared:.6f}")
         self.log(f"\nADF Test (ε ~ I(0)) P-value: {adf_pval:.6f}")
         self.log(f"Engle-Granger Test P-value: {eg_pval:.6f}")
         self.log(f"\nReversions over period: {reversions}")
         self.log(f"Current Z-Score: {current_z_score:.6f}")
+
+    def run_profit_simulation(self):
+        """Run a simple backtest using the Profit_Calc.simulate_pairs_trade logic.
+        This uses the last downloaded `combined` DataFrame (require running cointegration test first).
+        For simplicity the data is split into train (first half) and trade (second half).
+        """
+        try:
+            if simulate_pairs_trade is None or fit_hedge_ratio is None or compute_spread is None:
+                messagebox.showerror("Error", "Profit simulation helpers not available (could not import Profit_Calc.py)")
+                return
+
+            if self.last_combined is None:
+                messagebox.showerror("Error", "No data available. Run the cointegration test first to load data.")
+                return
+
+            combined = self.last_combined.copy()
+            # rename to A/B expected by Profit_Calc helpers
+            df = combined.rename(columns={self.ticker1_var.get().strip().upper(): "A",
+                                           self.ticker2_var.get().strip().upper(): "B"})
+
+            if len(df) < 10:
+                messagebox.showerror("Error", "Not enough data to run a meaningful simulation.")
+                return
+
+            mid = len(df) // 2
+            train = df.iloc[:mid]
+            trade = df.iloc[mid:]
+
+            # fit hedge ratio on train (A = beta * B + intercept)
+            beta, intercept = fit_hedge_ratio(train)
+
+            spread_train = compute_spread(train, beta, intercept)
+            mu = spread_train.mean()
+            sigma = spread_train.std(ddof=0)
+            if sigma == 0 or np.isnan(sigma):
+                messagebox.showerror("Error", "Train spread std is zero or NaN.")
+                return
+
+            # attach beta to trade DataFrame as expected by simulate_pairs_trade
+            trade._beta = beta
+            spread_trade = compute_spread(trade, beta, intercept)
+
+            enter_sd = float(self.reversion_max_var.get())
+            exit_sd = float(self.reversion_min_var.get())
+
+            sim = simulate_pairs_trade(trade, spread_trade, mu, sigma, enter_sd, exit_sd)
+
+            # show summary in the results text
+            out_lines = []
+            out_lines.append(f"Hedge ratio (beta): {beta:.6f}, intercept: {intercept:.6f}")
+            out_lines.append(f"Train spread mean: {mu:.6f}, std: {sigma:.6f}")
+            out_lines.append(f"Enter threshold (sd): {enter_sd}, Exit threshold (sd): {exit_sd}")
+            out_lines.append(f"Number of trades: {len(sim['trades'])}")
+            out_lines.append(f"Total P&L (units of price): {sim['total_pnl']:.6f}")
+
+            # per-trade details
+            for idx, t in enumerate(sim['trades']):
+                ei, xi = t['entry_idx'], t['exit_idx']
+                pnl = np.sum(sim['pnl_daily'][ei:xi+1])
+                out_lines.append(f"Trade {idx}: {ei}->{xi} entry_z={t['entry_z']:.3f}, exit_z={t['exit_z']:.3f}, pnl={pnl:.6f}")
+
+            for line in out_lines:
+                self.log(line)
+
+            # plot spread and equity on the embedded figure
+            self.figure.clear()
+            ax1 = self.figure.add_subplot(2, 1, 1)
+            ax1.plot(trade.index, spread_trade, label='Spread')
+            ax1.axhline(mu, color='gray', linestyle='--', label='Train mean')
+            ax1.axhline(mu + enter_sd*sigma, color='red', linestyle='--', label='Enter +/-')
+            ax1.axhline(mu - enter_sd*sigma, color='red', linestyle='--')
+            ax1.axhline(mu + exit_sd*sigma, color='orange', linestyle=':')
+            ax1.axhline(mu - exit_sd*sigma, color='orange', linestyle=':')
+            ax1.set_title('Spread and thresholds')
+            ax1.legend()
+
+            ax2 = self.figure.add_subplot(2, 1, 2)
+            ax2.plot(trade.index, sim['equity'], label='Equity (cumulative P&L)')
+            ax2.set_title('Equity curve')
+            ax2.axhline(0, color='gray', linestyle='--')
+            ax2.legend()
+
+            self.figure.tight_layout()
+            self.canvas.draw()
+
+        except Exception as e:
+            messagebox.showerror('Error', str(e))
 
 
 if __name__ == "__main__":
