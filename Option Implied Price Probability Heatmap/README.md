@@ -4,4 +4,4 @@ This project uses Yahoo Finance options chain data to generate the implied proba
 
 option_prob_heatmap visualizes this in a sns heatmap over a certain time period, while CofKVisualization graphs C(K), the spline it generates, and the pdf for a specific date.
 
-As of 1/13, there is no "band" functionality for heatmap generation, and put call conversions can cause buggyness (by default uses call-only)
+As of 1/13, there is no "band" functionality for heatmap generation, and put call conversions can cause buggyness (by default uses call-only).
